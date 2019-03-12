@@ -7,6 +7,7 @@ import math
 import time
 
 from tqdm import tqdm
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -16,10 +17,15 @@ from dataset import TranslationDataset, paired_collate_fn
 from transformer.Models import Transformer
 from transformer.Optim import ScheduledOptim
 
-def cal_performance(pred, gold, smoothing=False):
+from torch.optim import SGD
+
+from sketched_sgd.sketched_optimizer import SketchedSGD, SketchedSum
+
+
+def cal_performance(pred, gold, summer, smoothing=False):
     ''' Apply label smoothing if needed '''
 
-    loss = cal_loss(pred, gold, smoothing)
+    loss = cal_loss(pred, gold, summer, smoothing)
 
     pred = pred.max(1)[1]
     gold = gold.contiguous().view(-1)
@@ -30,7 +36,7 @@ def cal_performance(pred, gold, smoothing=False):
     return loss, n_correct
 
 
-def cal_loss(pred, gold, smoothing):
+def cal_loss(pred, gold, summer, smoothing):
     ''' Calculate cross entropy loss, apply label smoothing if needed. '''
 
     gold = gold.contiguous().view(-1)
@@ -46,13 +52,17 @@ def cal_loss(pred, gold, smoothing):
         non_pad_mask = gold.ne(Constants.PAD)
         loss = -(one_hot * log_prb).sum(dim=1)
         loss = loss.masked_select(non_pad_mask).sum()  # average later
+        #loss = summer(loss.masked_select(non_pad_mask))  # average later
+        #loss = loss.sum()
     else:
         loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='sum')
+        #loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='none')
+        #loss = summer(loss)
 
     return loss
 
 
-def train_epoch(model, training_data, optimizer, device, smoothing):
+def train_epoch(model, training_data, optimizer, summer, device, smoothing):
     ''' Epoch operation in training phase'''
 
     model.train()
@@ -74,11 +84,12 @@ def train_epoch(model, training_data, optimizer, device, smoothing):
         pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
 
         # backward
-        loss, n_correct = cal_performance(pred, gold, smoothing=smoothing)
+        loss, n_correct = cal_performance(pred, gold, summer, smoothing=smoothing)
         loss.backward()
 
         # update parameters
-        optimizer.step_and_update_lr()
+        #optimizer.step_and_update_lr()
+        optimizer.step()
 
         # note keeping
         total_loss += loss.item()
@@ -87,12 +98,14 @@ def train_epoch(model, training_data, optimizer, device, smoothing):
         n_word = non_pad_mask.sum().item()
         n_word_total += n_word
         n_word_correct += n_correct
+        #if n_word_total >= 10000:
+        #    break
 
     loss_per_word = total_loss/n_word_total
     accuracy = n_word_correct/n_word_total
     return loss_per_word, accuracy
 
-def eval_epoch(model, validation_data, device):
+def eval_epoch(model, validation_data, summer, device):
     ''' Epoch operation in evaluation phase '''
 
     model.eval()
@@ -112,7 +125,7 @@ def eval_epoch(model, validation_data, device):
 
             # forward
             pred = model(src_seq, src_pos, tgt_seq, tgt_pos)
-            loss, n_correct = cal_performance(pred, gold, smoothing=False)
+            loss, n_correct = cal_performance(pred, gold, summer, smoothing=False)
 
             # note keeping
             total_loss += loss.item()
@@ -126,7 +139,7 @@ def eval_epoch(model, validation_data, device):
     accuracy = n_word_correct/n_word_total
     return loss_per_word, accuracy
 
-def train(model, training_data, validation_data, optimizer, device, opt):
+def train(model, training_data, validation_data, optimizer, summer, device, opt):
     ''' Start training '''
 
     log_train_file = None
@@ -148,15 +161,16 @@ def train(model, training_data, validation_data, optimizer, device, opt):
         print('[ Epoch', epoch_i, ']')
 
         start = time.time()
-        train_loss, train_accu = train_epoch(
-            model, training_data, optimizer, device, smoothing=opt.label_smoothing)
+        train_loss, train_accu = train_epoch(model, training_data, optimizer,
+                                             summer, device,
+                                             smoothing=opt.label_smoothing)
         print('  - (Training)   ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
               'elapse: {elapse:3.3f} min'.format(
                   ppl=math.exp(min(train_loss, 100)), accu=100*train_accu,
                   elapse=(time.time()-start)/60))
 
         start = time.time()
-        valid_loss, valid_accu = eval_epoch(model, validation_data, device)
+        valid_loss, valid_accu = eval_epoch(model, validation_data, summer, device)
         print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '\
                 'elapse: {elapse:3.3f} min'.format(
                     ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu,
@@ -254,14 +268,27 @@ def main():
         n_layers=opt.n_layers,
         n_head=opt.n_head,
         dropout=opt.dropout).to(device)
+    D = 0
+    for p in transformer.parameters():
+        D += np.product(p.data.size())
+    print("D:", D)
 
+    """
     optimizer = ScheduledOptim(
         optim.Adam(
             filter(lambda x: x.requires_grad, transformer.parameters()),
             betas=(0.9, 0.98), eps=1e-09),
         opt.d_model, opt.n_warmup_steps)
+    """
+    params = list(filter(lambda x: x.requires_grad, transformer.parameters()))
+    optimizer = SGD(params, lr=1e-3, momentum=0.9, weight_decay=1e-4)
+    #optimizer = SketchedSGD(params, optimizer,
+    #                        accumulateError=True, k=100000, p1=0, p2=10)
+    #summer = SketchedSum(params, optimizer, 1000, 9, 4)
+    summer = None
 
-    train(transformer, training_data, validation_data, optimizer, device ,opt)
+    train(transformer, training_data, validation_data,
+          optimizer, summer, device, opt)
 
 
 def prepare_dataloaders(data, opt):
