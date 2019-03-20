@@ -21,6 +21,7 @@ from torch.optim import SGD
 
 from sketched_sgd.sketched_optimizer import SketchedSGD, SketchedSum
 
+g_stepIdx = 1
 
 def cal_performance(pred, gold, summer, smoothing=False):
     ''' Apply label smoothing if needed '''
@@ -51,16 +52,18 @@ def cal_loss(pred, gold, summer, smoothing):
 
         non_pad_mask = gold.ne(Constants.PAD)
         loss = -(one_hot * log_prb).sum(dim=1)
-        loss = loss.masked_select(non_pad_mask).sum()  # average later
-        #loss = summer(loss.masked_select(non_pad_mask))  # average later
-        #loss = loss.sum()
+        if summer is None:
+            loss = loss.masked_select(non_pad_mask).sum()  # average later
+        else:
+            loss = summer(loss.masked_select(non_pad_mask))  # average later
     else:
-        loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='sum')
-        #loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='none')
-        #loss = summer(loss)
+        if summer is None:
+            loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='sum')
+        else:
+            loss = F.cross_entropy(pred, gold, ignore_index=Constants.PAD, reduction='none')
+            loss = summer(loss)
 
     return loss
-
 
 def train_epoch(model, training_data, optimizer, summer, device, smoothing):
     ''' Epoch operation in training phase'''
@@ -89,7 +92,13 @@ def train_epoch(model, training_data, optimizer, summer, device, smoothing):
 
         # update parameters
         #optimizer.step_and_update_lr()
+        global g_stepIdx
+        lr = (512**-0.5) * np.min([g_stepIdx**-0.5, g_stepIdx*4000**-1.5])
+        #print(lr, loss.item())
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
         optimizer.step()
+        g_stepIdx += 1
 
         # note keeping
         total_loss += loss.item()
@@ -98,11 +107,40 @@ def train_epoch(model, training_data, optimizer, summer, device, smoothing):
         n_word = non_pad_mask.sum().item()
         n_word_total += n_word
         n_word_correct += n_correct
-        #if n_word_total >= 10000:
-        #    break
+        if False and n_word_total >= 100000:
+            break
 
     loss_per_word = total_loss/n_word_total
     accuracy = n_word_correct/n_word_total
+
+    """
+    import gc
+    totSize = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                if obj.is_cuda:
+                    print(type(obj), obj.size(), np.product(obj.size()))
+                    totSize += np.product(obj.size()) * 4
+        except OSError as e:
+            print("oserror on obj", obj)
+        except NotImplementedError as e:
+            print("notimplementederror on obj", obj)
+        except KeyError as e:
+            print("keyerror on obj", obj)
+        except RuntimeError as e:
+            print("runtimeerror on obj", obj)
+    print("totSize", totSize/1e9)
+    print("memory_allocated", torch.cuda.memory_allocated()/1e9)
+    print("max_memory_allocated", torch.cuda.max_memory_allocated()/1e9)
+    print("memory_cached", torch.cuda.memory_cached()/1e9)
+
+    torch.cuda.empty_cache()
+    print("memory_cached", torch.cuda.memory_cached()/1e9)
+    time.sleep(10)
+    exit()
+    """
+
     return loss_per_word, accuracy
 
 def eval_epoch(model, validation_data, summer, device):
@@ -253,6 +291,7 @@ def main():
 
     print(opt)
 
+
     device = torch.device('cuda' if opt.cuda else 'cpu')
     transformer = Transformer(
         opt.src_vocab_size,
@@ -280,11 +319,21 @@ def main():
             betas=(0.9, 0.98), eps=1e-09),
         opt.d_model, opt.n_warmup_steps)
     """
-    params = list(filter(lambda x: x.requires_grad, transformer.parameters()))
-    optimizer = SGD(params, lr=1e-3, momentum=0.9, weight_decay=1e-4)
+    #params = list(filter(lambda x: x.requires_grad, transformer.parameters()))
+    optimizer = SGD(filter(lambda x: x.requires_grad, transformer.parameters()),
+                    lr=0, momentum=0.9, weight_decay=1e-4)
+    """
+    optimizer = ScheduledOptim(
+                    optim.Adam(
+                        filter(lambda x: x.requires_grad, transformer.parameters()),
+                        betas=(0.9, 0.98),
+                        eps=1e-09),
+                    opt.d_model,
+                    opt.n_warmup_steps)
+    """
     #optimizer = SketchedSGD(params, optimizer,
-    #                        accumulateError=True, k=100000, p1=0, p2=10)
-    #summer = SketchedSum(params, optimizer, 1000, 9, 4)
+    #                        accumulateError=True, k=100000, p1=0, p2=50)
+    #summer = SketchedSum(params, optimizer, 100000, 19, 1)
     summer = None
 
     train(transformer, training_data, validation_data,
